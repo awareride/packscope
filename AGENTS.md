@@ -9,11 +9,6 @@ from webpack/rspack) into:
 
 Sample target: `./examples/node_large_example.js` (4339 modules, entry `29570`, one external `chokidar`).
 
-## What Exists Prior
-
-- `split-legacy.js` in `dist/` — slices the bundle into raw minified fragments + header + runtime + manifest + rebuild script. **Not beautified, not individually executable.**
-- Prior work in `dist/legacy-next/` already has 4340 raw fragment files. Our tool supersedes this with a proper executable loader.
-
 ## Architecture Decisions
 
 ### 1. Loader = reconstructed original bundle shape (most robust)
@@ -24,15 +19,25 @@ Instead of hand-rolling a `__webpack_require__` runtime (easy to miss helpers li
 header.js  +  __webpack_modules__ = { <delegator props> }  +  webpack-runtime.js
 ```
 
-- `header.js` — everything up to and including `var __webpack_modules__={`
+- `header.js` — everything up to and including the opening `{` of the webpack modules dictionary (even when `__webpack_modules__` has been minified to a single-letter variable such as `var t={...}`)
 - `webpack-runtime.js` — everything from the closing `}` onward (original runtime, entry call, UMD footer)
 - Each `__webpack_modules__[id]` is a thin delegator: `function(module, exports, req) { return loadFactory(id).call(this, ...); }`
 
+The modules dictionary is located by shape — we find the webpack-style require function (the one that calls `<modules>[id].call(...)`) and then resolve the variable that holds the modules object. This works even when `__webpack_modules__` and `__webpack_require__` have been minified to single-letter identifiers.
+
 This reuses **100% of the original UMD + webpack runtime verbatim**, so externals and all runtime helpers work as-is.
 
-### 2. Module files = `module.exports = function(eA, el, ec) { <original body> };`
+### 2. Module files keep the original wrapper shape
 
-**Default behavior** keeps the **original minified body slice** (byte-faithful). This guarantees the unpacked tree executes identically to the original.
+**Default behavior** emits either:
+
+```js
+module.exports = function(eA, el, ec) { <original body> };
+// or, when the original wrapper is an arrow function:
+module.exports = (eA, el, ec) => { <original body> };
+```
+
+This keeps the **original minified body slice** (byte-faithful) and the original `this`-binding semantics, so the unpacked tree executes identically to the original.
 
 We spent significant effort trying to make beautified/regenerated bodies the default (js-beautify, then escodegen, then AST-based rename). All of them introduced subtle runtime regressions:
 - `js-beautify` dropped a `var` keyword in one module, creating a TDZ `ReferenceError`
@@ -80,7 +85,7 @@ node out/bundle-patched.js --version    # → 2.106.4 ✅
 
 ```
 out/
-  header.js              # UMD header up to `{` of __webpack_modules__
+  header.js              # UMD header up to `{` of the modules dictionary
   webpack-runtime.js     # original runtime + footer from `}` onward
   runtime.js             # loader (reconstructed bundle with delegators)
   index.js               # shebang entry; runs the loader
