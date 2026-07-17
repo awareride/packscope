@@ -223,6 +223,125 @@ function findWebpackModulesNode(node) {
   return null;
 }
 
+function findWebpackRequireFunction(ast, source) {
+  function walk(node) {
+    if (!node || typeof node !== 'object') return null;
+    if (Array.isArray(node)) {
+      for (const item of node) {
+        const found = walk(item);
+        if (found) return found;
+      }
+      return null;
+    }
+    if (
+      (node.type === 'FunctionDeclaration' ||
+        node.type === 'FunctionExpression' ||
+        node.type === 'ArrowFunctionExpression') &&
+      node.params.length === 1 &&
+      node.params[0].type === 'Identifier'
+    ) {
+      const paramName = node.params[0].name;
+      let modulesName = null;
+      (function scan(n) {
+        if (!n || typeof n !== 'object') return;
+        if (Array.isArray(n)) {
+          for (const c of n) scan(c);
+          return;
+        }
+        if (!n.type) return;
+        if (
+          n.type === 'CallExpression' &&
+          n.callee &&
+          n.callee.type === 'MemberExpression' &&
+          !n.callee.computed &&
+          n.callee.property.type === 'Identifier' &&
+          n.callee.property.name === 'call'
+        ) {
+          const inner = n.callee.object;
+          if (
+            inner &&
+            inner.type === 'MemberExpression' &&
+            inner.computed &&
+            inner.property.type === 'Identifier' &&
+            inner.property.name === paramName &&
+            inner.object &&
+            inner.object.type === 'Identifier'
+          ) {
+            modulesName = inner.object.name;
+            return;
+          }
+        }
+        for (const k of Object.keys(n)) {
+          if (['type', 'start', 'end', 'loc', 'range'].includes(k)) continue;
+          scan(n[k]);
+        }
+      })(node.body);
+      if (modulesName) return { fn: node, modulesName };
+    }
+    for (const key of Object.keys(node)) {
+      const child = node[key];
+      if (Array.isArray(child)) {
+        const found = walk(child);
+        if (found) return found;
+      } else if (child && typeof child === 'object' && child.type) {
+        const found = walk(child);
+        if (found) return found;
+      }
+    }
+    return null;
+  }
+  return walk(ast);
+}
+
+function findVariableDeclaratorForName(ast, name) {
+  const candidates = [];
+  function walk(node) {
+    if (!node || typeof node !== 'object') return;
+    if (Array.isArray(node)) {
+      for (const item of node) walk(item);
+      return;
+    }
+    if (node.type === 'VariableDeclarator' && node.id && node.id.type === 'Identifier' && node.id.name === name) {
+      if (node.init && node.init.type === 'ObjectExpression') {
+        candidates.push(node);
+        return;
+      }
+    }
+    for (const key of Object.keys(node)) {
+      if (['type', 'start', 'end', 'loc', 'range'].includes(key)) continue;
+      const child = node[key];
+      if (Array.isArray(child)) {
+        for (const item of child) walk(item);
+      } else if (child && typeof child === 'object' && child.type) {
+        walk(child);
+      }
+    }
+  }
+  walk(ast);
+  if (!candidates.length) return null;
+  if (candidates.length === 1) return candidates[0];
+  // If several variables share the minified name, pick the one that looks most
+  // like a webpack modules dictionary (an object of factory functions).
+  function score(decl) {
+    return decl.init.properties.filter((p) =>
+      p.value &&
+      (p.value.type === 'FunctionExpression' || p.value.type === 'ArrowFunctionExpression')
+    ).length;
+  }
+  return candidates.reduce((best, cur) => (score(cur) > score(best) ? cur : best));
+}
+
+function findWebpackModulesDeclarator(ast, source) {
+  const exact = findWebpackModulesNode(ast);
+  if (exact) return exact;
+  // Fallback for aggressively minified bundles where __webpack_modules__ has
+  // been renamed to a single letter (e.g. var t={173:function(...),...}).
+  const match = findWebpackRequireFunction(ast, source);
+  if (!match) return null;
+  const { modulesName } = match;
+  return findVariableDeclaratorForName(ast, modulesName);
+}
+
 function collectPatternBindings(pattern, out) {
   if (!pattern) return;
   switch (pattern.type) {
@@ -475,7 +594,7 @@ async function main() {
   const ast = acorn.parse(source, { ecmaVersion: 'latest', sourceType: 'script' });
   console.log(`[packscope] parsed in ${Date.now() - t0} ms`);
 
-  const declarator = findWebpackModulesNode(ast);
+  const declarator = findWebpackModulesDeclarator(ast, source);
   if (!declarator || !declarator.init || declarator.init.type !== 'ObjectExpression') {
     throw new Error('Could not find `var __webpack_modules__ = {...}` in the bundle');
   }
@@ -521,7 +640,8 @@ async function main() {
       continue;
     }
     const fn = prop.value;
-    if (!fn || fn.type !== 'FunctionExpression') {
+    const isFactory = fn && (fn.type === 'FunctionExpression' || fn.type === 'ArrowFunctionExpression');
+    if (!isFactory) {
       // non-function property (rare); keep raw
       const raw = source.slice(prop.start, prop.end);
       fs.writeFileSync(path.join(outDir, 'modules', `${keyName}.js`), raw + '\n');
@@ -530,12 +650,17 @@ async function main() {
       continue;
     }
 
-    const bodySrc = source.slice(fn.body.start, fn.body.end);
+    let bodySrc = source.slice(fn.body.start, fn.body.end);
+    if (fn.type === 'ArrowFunctionExpression' && fn.body.type !== 'BlockStatement') {
+      bodySrc = `{ return ${bodySrc}; }`;
+    }
     const paramNames = fn.params.map((p) => (p.type === 'Identifier' ? p.name : '?')).join(', ');
     // Default: keep the original (minified) module body verbatim. This is byte-
     // faithful to the bundle and is guaranteed to execute identically. The module
     // is isolated in its own file (navigable) with a documented param mapping.
-    let generated = `function(${paramNames}) ${bodySrc}`;
+    let generated = fn.type === 'ArrowFunctionExpression'
+      ? `(${paramNames}) => ${bodySrc}`
+      : `function(${paramNames}) ${bodySrc}`;
     if (args.beautify) {
       // Opt-in pretty printing via escodegen (AST-faithful re-generation).
       // NOTE: for modules involved in fragile circular-dependency timings this can
@@ -580,6 +705,7 @@ async function main() {
       deps,
       name: nameHint,
       file: `modules/${keyName}.js`,
+      arrow: fn.type === 'ArrowFunctionExpression',
     });
 
     count++;
@@ -1347,7 +1473,11 @@ for (const mod of manifest.modules) {
   (function walk(n) {
     if (!n || typeof n !== 'object') return;
     if (Array.isArray(n)) { n.forEach(walk); return; }
-    if (n.type === 'FunctionExpression' && n.body && n.body.type === 'BlockStatement') { fn = n; return; }
+    if (
+      (n.type === 'FunctionExpression' || n.type === 'ArrowFunctionExpression') &&
+      n.body &&
+      n.body.type === 'BlockStatement'
+    ) { fn = n; return; }
     for (const k of Object.keys(n)) {
       if (k === 'type' || k === 'start' || k === 'end' || k === 'loc' || k === 'range') continue;
       const c = n[k];
@@ -1357,7 +1487,11 @@ for (const mod of manifest.modules) {
   if (!fn) { console.error('skip', mod.id); continue; }
   const paramsSrc = fn.params.length ? src.slice(fn.params[0].start, fn.params[fn.params.length - 1].end) : '';
   const bodySrc = src.slice(fn.body.start, fn.body.end);
-  props.push(\`\${mod.id}(\${paramsSrc}) \${bodySrc}\`);
+  if (mod.arrow) {
+    props.push(\`\${mod.id}: (\${paramsSrc}) => \${bodySrc}\`);
+  } else {
+    props.push(\`\${mod.id}: function(\${paramsSrc}) \${bodySrc}\`);
+  }
 }
 parts.push(props.join(',\\n'));
 parts.push(fs.readFileSync(path.join(outDir, 'webpack-runtime.js'), 'utf8'));

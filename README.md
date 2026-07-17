@@ -46,7 +46,7 @@ Options:
 ### webpack/rspack bundles
 
 ```
-header.js               # original UMD + bundle header, up to `{` of __webpack_modules__
+header.js               # original UMD + bundle header, up to `{` of the modules dictionary
 webpack-runtime.js      # original webpack/rspack runtime + footer, from `}` onward
 runtime.js              # loader: reconstructs the bundle with per-file module delegation
 index.js                # shebang entry; wires externals, runs the entry module (the CLI)
@@ -150,14 +150,16 @@ node bundle-edited.js --version
 
 ## How it works
 
-1. Parse the bundle with **acorn**, locate `var __webpack_modules__ = { ... }`.
-2. For each module, extract the original function body verbatim and write it as:
+1. Parse the bundle with **acorn** and locate the webpack modules dictionary. It is found by shape: the tool identifies the webpack-style require function (the one that calls `<modules>[id].call(...)`) and then resolves the variable that holds the modules object. This works even when `__webpack_modules__` and `__webpack_require__` have been minified to single-letter identifiers.
+2. For each module, extract the original factory body verbatim and write it as:
    ```js
    // webpack module <id>
    // params: eA, el, ec  (=> module, exports, require)
    module.exports = function(eA, el, ec) { <original body> };
+   // or, when the original wrapper is an arrow function:
+   module.exports = (eA, el, ec) => { <original body> };
    ```
-   This guarantees the unpacked tree executes **exactly** like the original.
+   Preserving the original wrapper shape (function vs. arrow) keeps the `this`-binding semantics identical, so the unpacked tree executes **exactly** like the original.
 3. The loader (`runtime.js`) rebuilds the original bundle expression:
    `header.js` + `__webpack_modules__ = { <delegator props> }` + `webpack-runtime.js`.
    Each `__webpack_modules__[id]` is a tiny delegator that `require`s the corresponding
