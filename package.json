@@ -10,7 +10,7 @@
     "type": "git",
     "url": "https://github.com/awareride/packscope.git"
   },
-  "homepage": "https://github.com/awareride/packscope#readme",
+  "homepage": "https://open.awareride.com/packscope/",
   "files": [
     "packscope.js",
     "icon.svg",
