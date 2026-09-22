@@ -559,24 +559,35 @@ function analyzeScope(fnNode, renameMap) {
 // ---------------------------------------------------------------------------
 // Extract entry id + externals from the full source
 // ---------------------------------------------------------------------------
-function detectEntry(source) {
+function detectEntry(source, runtimeOffset) {
   const m = source.match(/var\s+__webpack_exports__\s*=\s*__webpack_require__\((\d+)\)/);
   if (m) return m[1];
-  const all = [...source.matchAll(/__webpack_require__\((\d+)\)/g)];
+  const searchSrc = typeof runtimeOffset === 'number' ? source.slice(runtimeOffset) : source;
+  const all = [...searchSrc.matchAll(/__webpack_require__\((\d+)\)/g)];
   if (all.length) return all[all.length - 1][1];
   return null;
 }
 
 function detectExternals(source) {
-  // module bodies look like: <id>(eA){ if(void 0===__rspack_external__59547){...Cannot find module 'chokidar'...} eA.exports=__rspack_external__59547 }
+  // RSPACK: module bodies look like: <id>(eA){ if(void 0===__rspack_external__59547){...Cannot find module 'chokidar'...} eA.exports=__rspack_external__59547 }
   const externals = {};
-  const re = /__rspack_external__(\d+)/g;
+  const rspackRe = /__rspack_external__(\d+)/g;
   let m;
-  while ((m = re.exec(source))) {
+  while ((m = rspackRe.exec(source))) {
     const id = m[1];
     const around = source.slice(Math.max(0, m.index - 400), m.index + 400);
     const pkg = (around.match(/Cannot find module ['"]([^'"]+)['"]/) || [])[1];
     if (pkg) externals[id] = pkg;
+  }
+  // WEBPACK: scan for "Cannot find module 'pkg'" and infer the module ID
+  // from nearby module-dictionary entries (which look like "N:function(...)").
+  const webpackSmRe = /Cannot find module ['"]([^'"]+)['"]/g;
+  while ((m = webpackSmRe.exec(source))) {
+    const pkg = m[1];
+    if (Object.prototype.hasOwnProperty.call(externals, pkg)) continue;
+    const before = source.slice(Math.max(0, m.index - 2000), m.index);
+    const idMatch = before.match(/(\d+)\s*:\s*function/);
+    if (idMatch) externals[idMatch[1]] = pkg;
   }
   return externals;
 }
@@ -657,7 +668,7 @@ async function main() {
   // webpack-runtime = from the closing brace onward (starts with '}')
   fs.writeFileSync(path.join(outDir, 'webpack-runtime.js'), source.slice(modulesObjEnd - 1));
 
-  const entry = args.entry || detectEntry(source);
+  const entry = args.entry || detectEntry(source, modulesObjEnd);
   const externals = detectExternals(source);
   console.log(`[packscope] entry module: ${entry}`);
   console.log(`[packscope] externals: ${JSON.stringify(externals)}`);
@@ -732,7 +743,6 @@ async function main() {
 
     // dependencies (require(X)) from the original (pre-rename) body
     const deps = [];
-    const depRe = /(?:^|[^.A-Za-z0-9_])(?:module|exports|require)\((\d+)\)/g;
     // the require param is the 3rd position name; capture by that name
     const reqName = fn.params[2] && fn.params[2].type === 'Identifier' ? fn.params[2].name : null;
     const re2 = reqName ? new RegExp(reqName + '\\((\\d+)\\)', 'g') : null;
@@ -1331,11 +1341,20 @@ async function withConcurrency(tasks, limit) {
     const p = Promise.resolve(task());
     results.push(p);
     executing.push(p);
-    p.then(() => {
+    const cleanup = () => {
       const i = executing.indexOf(p);
       if (i !== -1) executing.splice(i, 1);
-    });
-    if (executing.length >= limit) await Promise.race(executing);
+    };
+    p.then(cleanup, cleanup);
+    if (executing.length >= limit) {
+      // Wait for at least one in-flight task to finish (success or failure)
+      // before starting more. Wrapping each promise so the race resolves
+      // instead of rejecting prevents a single failure from abandoning the
+      // rest of the queue.
+      await Promise.race(
+        executing.map((ep) => ep.then(() => true, () => true))
+      );
+    }
   }
   return Promise.all(results);
 }
